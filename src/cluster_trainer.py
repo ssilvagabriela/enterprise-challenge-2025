@@ -1,280 +1,422 @@
+# src/cluster_trainer.py
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Tuple, Optional, Literal, Dict
+from typing import Dict, List, Optional, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.metrics import silhouette_score
-from sklearn.preprocessing import StandardScaler
 
+from src.io_saver import ensure_dir, save_single_parquet
 from src import schema_config as sc
-from src.io_saver import ensure_dir, save_parquet
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
-@dataclass
-class ClusterEval:
-    k: int
-    inertia: float
-    silhouette: Optional[float]
-
-
-def _get_algo(
-    algo: Literal["kmeans", "minibatch"],
+# =====================================================================
+# Model factory
+# =====================================================================
+def _make_model(
     k: int,
+    *,
+    algorithm: str = "kmeans",
     random_state: int = 42,
-    n_init: int = 10,
-    batch_size: int = 2048,
+    n_init: int | str = 10,
     max_iter: int = 300,
+    batch_size: int = 1024,
 ):
-    if algo == "kmeans":
-        return KMeans(
-            n_clusters=k,
-            n_init=n_init,
-            max_iter=max_iter,
-            random_state=random_state,
-            verbose=0,
-        )
-    elif algo == "minibatch":
+    """
+    Constrói o estimador de clustering conforme o algoritmo solicitado.
+    """
+    algo = algorithm.lower()
+    if algo in {"kmeans", "k-means"}:
+        return KMeans(n_clusters=k, random_state=random_state, n_init=n_init, max_iter=max_iter)
+    elif algo in {"minibatchkmeans", "minibatch-kmeans", "mbkmeans"}:
         return MiniBatchKMeans(
             n_clusters=k,
-            n_init=n_init,
-            batch_size=batch_size,
-            max_iter=max_iter,
             random_state=random_state,
-            verbose=0,
+            n_init=n_init if isinstance(n_init, int) else 10,
+            max_iter=max_iter,
+            batch_size=batch_size,
         )
-    else:
-        raise ValueError("algo deve ser 'kmeans' ou 'minibatch'.")
+    raise ValueError(f"Algoritmo não suportado: {algorithm!r}. Use 'kmeans' ou 'minibatchkmeans'.")
 
 
-def _maybe_sample_indices(n: int, max_samples: int) -> np.ndarray:
-    if n <= max_samples:
-        return np.arange(n)
-    rng = np.random.default_rng(42)
-    return rng.choice(n, size=max_samples, replace=False)
+# =====================================================================
+# Avaliação de k
+# =====================================================================
+@dataclass
+class EvalResult:
+    k: int
+    inertia: float
+    silhouette: float
 
 
 def evaluate_k_range(
     X: np.ndarray,
-    k_values: Iterable[int] = range(2, 11),
-    algo: Literal["kmeans", "minibatch"] = "minibatch",
+    *,
+    k_values: List[int],
+    algorithm: str = "kmeans",
     random_state: int = 42,
-    silhouette_max_samples: int = 20000,
-) -> List[ClusterEval]:
+    n_init: int | str = 10,
+    max_iter: int = 300,
+    batch_size: int = 1024,
+    silhouette_max_samples: int = 10000,
+) -> List[EvalResult]:
     """
-    Treina modelos para vários k e retorna SSE (inertia) e Silhouette.
-    Para Silhouette, amostra no máximo 'silhouette_max_samples' pontos por performance.
+    Treina modelos para cada k e retorna lista de métricas (inertia, silhouette).
+    - Silhouette é calculado em amostra aleatória (até `silhouette_max_samples`) para velocidade.
+    - k inviáveis são ignorados com warning (ex.: k > n amostras únicas).
     """
-    n = X.shape[0]
-    idx_s = _maybe_sample_indices(n, silhouette_max_samples)
+    n, d = X.shape
+    rng = np.random.RandomState(random_state)
 
-    evals: List[ClusterEval] = []
-    for k in k_values:
-        model = _get_algo(algo, k, random_state=random_state)
-        labels = model.fit_predict(X)
-        inertia = float(model.inertia_)
-        sil = None
-        # Silhouette só faz sentido com >1 cluster e >1 amostra no slice
+    results: List[EvalResult] = []
+    for k in sorted(set(k_values)):
+        if k < 2 or k > n:
+            logger.warning("k=%d inválido para n=%d. Pulando.", k, n)
+            continue
+
+        model = _make_model(
+            k,
+            algorithm=algorithm,
+            random_state=random_state,
+            n_init=n_init,
+            max_iter=max_iter,
+            batch_size=batch_size,
+        )
+
         try:
-            sil = float(silhouette_score(X[idx_s], labels[idx_s], metric="euclidean"))
+            labels = model.fit_predict(X)
+            inertia = float(model.inertia_)
         except Exception as e:
-            logger.warning(f"Silhouette falhou para k={k}: {e!r}")
-            sil = None
+            logger.warning("Falha ao treinar k=%d (%s). Pulando este k.", k, e)
+            continue
 
-        evals.append(ClusterEval(k=k, inertia=inertia, silhouette=sil))
-        logger.info("k=%d | inertia=%.4f | silhouette=%s", k, inertia, f"{sil:.4f}" if sil is not None else "NA")
-    return evals
+        # Silhouette somente se houver >1 cluster e ambos com amostras
+        unique_labels = np.unique(labels)
+        if unique_labels.size < 2:
+            sil = np.nan
+        else:
+            if n > silhouette_max_samples:
+                idx = rng.choice(n, size=silhouette_max_samples, replace=False)
+                sil = silhouette_score(X[idx], labels[idx], metric="euclidean")
+            else:
+                sil = silhouette_score(X, labels, metric="euclidean")
+
+        results.append(EvalResult(k=k, inertia=inertia, silhouette=float(sil)))
+        logger.info("k=%d | inertia=%.4f | silhouette=%s", k, inertia, f"{sil:.4f}" if np.isfinite(sil) else "nan")
+
+    if not results:
+        raise RuntimeError("Nenhum k válido pôde ser avaliado.")
+    return results
 
 
-def pick_best_k(
-    evals: List[ClusterEval],
-    prefer: Literal["silhouette", "elbow"] = "silhouette",
-    default_k: int = 5,
+def _choose_k(
+    evals: List[EvalResult],
 ) -> int:
     """
-    Heurística simples:
-    - se 'silhouette': pega k com maior silhouette (desempate pelo menor inertia)
-    - se 'elbow': escolhe o joelho via razão sucessiva de quedas (simples)
-    - fallback: default_k
+    Escolha de k:
+      1) Maior silhouette (desempate por menor inércia).
+      2) Se todos NaN, fallback "cotovelo": maior queda relativa de inércia.
     """
-    # 1) silhouette
-    if prefer == "silhouette":
-        sil = [(e.k, e.silhouette, e.inertia) for e in evals if e.silhouette is not None]
-        if sil:
-            # maior silhouette, em empate pega menor inertia
-            sil.sort(key=lambda t: (-t[1], t[2]))
-            return int(sil[0][0])
+    df = pd.DataFrame([e.__dict__ for e in evals]).sort_values("k").reset_index(drop=True)
 
-    # 2) elbow (queda relativa da inércia)
-    if evals and prefer == "elbow":
-        evals_sorted = sorted(evals, key=lambda e: e.k)
-        inertias = np.array([e.inertia for e in evals_sorted], dtype=float)
-        ks = np.array([e.k for e in evals_sorted])
-        # queda relativa: (I_{k-1} - I_k)/I_{k-1}
-        drops = (inertias[:-1] - inertias[1:]) / np.maximum(inertias[:-1], 1e-12)
-        # escolhe k no ponto de maior queda (i -> k = ks[i+1])
-        if len(drops) > 0:
-            best_i = int(np.argmax(drops))
-            return int(ks[best_i + 1])
+    # 1) Por silhouette (se houver pelo menos um valor finito)
+    df_sil = df[np.isfinite(df["silhouette"])]
+    if not df_sil.empty:
+        max_sil = df_sil["silhouette"].max()
+        cand = df_sil[df_sil["silhouette"] == max_sil].sort_values("inertia")
+        k_star = int(cand.iloc[0]["k"])
+        return k_star
 
-    # fallback
-    logger.warning("Não foi possível decidir k automaticamente. Usando default_k=%d.", default_k)
-    return int(default_k)
+    # 2) Fallback "cotovelo": maior queda relativa de inércia
+    #    Δ_i = (inertia_{i-1} - inertia_i) / inertia_{i-1}
+    inertia = df["inertia"].values
+    ks = df["k"].values
+    if len(inertia) < 2:
+        return int(ks[0])
+    drops = (inertia[:-1] - inertia[1:]) / np.clip(inertia[:-1], 1e-12, None)
+    i_star = int(np.argmax(drops))
+    return int(ks[i_star + 1])
 
 
-def train_final_model(
+# =====================================================================
+# Treino final e centróides
+# =====================================================================
+def fit_final_model(
     X: np.ndarray,
+    *,
     k: int,
-    algo: Literal["kmeans", "minibatch"] = "minibatch",
+    algorithm: str = "kmeans",
     random_state: int = 42,
-) -> Tuple[np.ndarray, object]:
-    model = _get_algo(algo, k, random_state=random_state)
+    n_init: int | str = 10,
+    max_iter: int = 300,
+    batch_size: int = 1024,
+):
+    """
+    Treina o modelo final com k definido.
+    """
+    model = _make_model(
+        k,
+        algorithm=algorithm,
+        random_state=random_state,
+        n_init=n_init,
+        max_iter=max_iter,
+        batch_size=batch_size,
+    )
     labels = model.fit_predict(X)
-    return labels, model
+    return model, labels
 
 
 def centroids_z_and_unstd(
     model,
-    scaler: StandardScaler,
-    used_cols: List[str],
+    *,
+    scaler,          # StandardScaler treinado
+    used_cols: List[str],  # ordem das colunas no treino/padronização
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Retorna centróides em z-score (Z) e despadronizados (Unstd).
-    - Para StandardScaler: X_unstd = Z * scale_ + mean_
+    Extrai centróides no espaço z (padronizado) e no espaço original (despadronizado).
+    Usa inverse_transform do scaler; em falha, cai para reconstrução manual.
     """
-    if not hasattr(model, "cluster_centers_"):
-        raise ValueError("Modelo não possui cluster_centers_.")
-    Z = np.asarray(model.cluster_centers_, dtype=float)  # (k, p)
+    Zc = np.asarray(model.cluster_centers_, dtype=float)  # (k, p)
+    df_z = pd.DataFrame(Zc, columns=[f"{c}_z" for c in used_cols])
 
-    # reconstroi no espaço original
-    if not isinstance(scaler, StandardScaler):
-        raise TypeError("scaler deve ser StandardScaler compatível com etapa 5.")
-    if getattr(scaler, "mean_", None) is None or getattr(scaler, "scale_", None) is None:
-        raise ValueError("Scaler não possui mean_ e scale_. Use o scaler salvo na etapa 5.")
+    try:
+        uc = scaler.inverse_transform(Zc)
+    except Exception as e:
+        logger.warning("Falha no inverse_transform do scaler (%s). Usando reconstrução manual.", e)
+        # fallback manual: x = z*scale + mean
+        mean = getattr(scaler, "mean_", None)
+        scale = getattr(scaler, "scale_", None)
+        if mean is None or scale is None:
+            raise RuntimeError("Scaler sem atributos mean_/scale_ para reconstrução manual.")
+        uc = Zc * scale[np.newaxis, :] + mean[np.newaxis, :]
 
-    mean = scaler.mean_.astype(float)
-    scale = scaler.scale_.astype(float)
-    X_unstd = Z * scale + mean
-
-    zcols = [f"{c}_z" for c in used_cols]
-    uncols = [f"{c}_unstd" for c in used_cols]
-
-    dfZ = pd.DataFrame(Z, columns=zcols)
-    dfU = pd.DataFrame(X_unstd, columns=uncols)
-
-    dfZ.insert(0, "cluster_id", np.arange(Z.shape[0], dtype=int))
-    dfU.insert(0, "cluster_id", np.arange(Z.shape[0], dtype=int))
-    return dfZ, dfU
+    df_unstd = pd.DataFrame(uc, columns=used_cols)
+    return df_z, df_unstd
 
 
-def load_standardized_features(path_parquet: Path | str, id_col: str) -> pd.DataFrame:
-    p = Path(path_parquet)
-    if not p.exists():
-        raise FileNotFoundError(f"Arquivo não encontrado: {p}")
-    df = pd.read_parquet(p)
-    if id_col not in df.columns:
-        raise ValueError(f"Coluna de id '{id_col}' não encontrada em {p}.")
-    return df
-
-
-def load_scaler(path_joblib: Path | str) -> StandardScaler:
-    p = Path(path_joblib)
-    if not p.exists():
-        raise FileNotFoundError(f"Scaler não encontrado: {p}")
-    scaler = joblib.load(p)
-    if not isinstance(scaler, StandardScaler):
-        raise TypeError("Objeto carregado não é StandardScaler.")
-    return scaler
-
-
+# =====================================================================
+# Pipeline de clustering (alto nível)
+# =====================================================================
 def run_clustering_pipeline(
-    df_std: pd.DataFrame,
-    used_cols: List[str],
-    scaler: StandardScaler,
-    algo: Literal["kmeans", "minibatch"] = "minibatch",
-    k_values: Iterable[int] = range(2, 11),
-    prefer: Literal["silhouette", "elbow"] = "silhouette",
-    default_k: int = 5,
+    df_std: Optional[pd.DataFrame] = None,
+    *,
+    X: Optional[np.ndarray] = None,            # opcional: matriz já pronta
+    id_col: str = getattr(sc, "CONTACT_ID", "fk_contact"),
+    used_cols: Optional[List[str]] = None,     # obrigatória se X for None? -> será inferida de df_std
+    z_suffix: str = "_z",
+
+    k_values: List[int] = list(range(2, 11)),
+    algorithm: str = "kmeans",
     random_state: int = 42,
-) -> Dict[str, pd.DataFrame | object | int | List[ClusterEval]]:
+    n_init: int | str = 10,
+    max_iter: int = 300,
+    batch_size: int = 1024,
+    silhouette_max_samples: int = 10000,
+) -> Dict[str, object]:
     """
-    Orquestra:
-      - avalia k
-      - escolhe k
-      - treina final
-      - devolve assignments e centróides (Z e unstd) + métricas.
+    Executa avaliação de k, escolhe k*, treina modelo final e retorna artefatos:
+      - assignments (DataFrame: id_col, cluster_id)
+      - centroids_z (DataFrame)
+      - centroids_unstd (DataFrame)
+      - evals (DataFrame com métricas por k e metadados)
+      - model (objeto KMeans/MiniBatchKMeans)
+      - k_best (int)
+      - meta (dict)
     """
-    # seleciona matriz X (nas colunas padronizadas *_z)
-    zcols = [f"{c}_z" for c in used_cols if f"{c}_z" in df_std.columns]
-    if not zcols:
-        raise ValueError("Nenhuma coluna *_z encontrada no DataFrame padronizado.")
-    X = df_std[zcols].to_numpy(dtype=float, copy=False)
+    if X is None:
+        if df_std is None:
+            raise ValueError("Forneça df_std (com colunas *_z) ou X (np.ndarray) já pronto.")
+        if used_cols is None:
+            # inferir pelas colunas padronizadas do df_std
+            used_cols = [c[:-len(z_suffix)] for c in df_std.columns if c.endswith(z_suffix)]
+            if not used_cols:
+                raise ValueError("Nenhuma coluna *_z encontrada para compor X. Informe 'used_cols' ou 'X'.")
+        z_cols = [f"{c}{z_suffix}" for c in used_cols]
+        missing = [c for c in z_cols if c not in df_std.columns]
+        if missing:
+            raise ValueError(f"Colunas padronizadas ausentes no df_std: {missing}")
+        X = df_std[z_cols].values
+    else:
+        if used_cols is None:
+            raise ValueError("Quando X é fornecido, 'used_cols' deve ser informado (ordem do treino).")
 
-    # 1) avaliar k
+    # 1) Avaliar k
     evals = evaluate_k_range(
-        X=X,
+        X,
         k_values=k_values,
-        algo=algo,
+        algorithm=algorithm,
         random_state=random_state,
+        n_init=n_init,
+        max_iter=max_iter,
+        batch_size=batch_size,
+        silhouette_max_samples=silhouette_max_samples,
+    )
+    k_best = _choose_k(evals)
+    logger.info("k* escolhido: %d", k_best)
+
+    # 2) Treinar final
+    model, labels = fit_final_model(
+        X,
+        k=k_best,
+        algorithm=algorithm,
+        random_state=random_state,
+        n_init=n_init,
+        max_iter=max_iter,
+        batch_size=batch_size,
     )
 
-    # 2) escolher k
-    k_best = pick_best_k(evals, prefer=prefer, default_k=default_k)
-    logger.info("k escolhido: %d", k_best)
-
-    # 3) treinar final
-    labels, model = train_final_model(
-        X=X, k=k_best, algo=algo, random_state=random_state
+    # 3) Centrôides nos dois espaços
+    # ✅ usa apenas um keyword 'scaler'
+    scaler_arg = None if df_std is None else getattr(df_std, "scaler", None)
+    df_cz, df_cu = centroids_z_and_unstd(
+        model,
+        used_cols=used_cols,
+        scaler=scaler_arg,
     )
 
-    # 4) assignments
-    assign = df_std[[sc.CONTACT_ID]].copy()
-    assign["cluster_id"] = labels.astype(int)
+    # OBS: acima tentamos pegar scaler a partir de df_std.scaler se o chamador anexou;
+    # se não existir, o chamador deve reconstruir mais adiante no artifacts. Como
+    # este módulo não recebe o scaler diretamente aqui, oferecemos também a função abaixo
+    # (centroids_com_scaler) para reconstrução explícita com scaler fornecido.
 
-    # 5) centróides (z e despadronizados)
-    dfZ, dfU = centroids_z_and_unstd(model, scaler, used_cols=used_cols)
+    # Como df_std não carrega o scaler por padrão, em muitos fluxos preferimos
+    # pedir explicitamente o scaler para reconstruir centróides. Então, oferecemos:
+    assignments = None
+    if df_std is not None and id_col in df_std.columns:
+        assignments = df_std[[id_col]].copy()
+        assignments["cluster_id"] = labels.astype(int)
+    else:
+        # Fallback: índice sequencial
+        assignments = pd.DataFrame({id_col: np.arange(len(labels)), "cluster_id": labels.astype(int)})
 
-    # 6) métricas em DataFrame
+    # Tabela de métricas
     df_evals = pd.DataFrame(
         [{"k": e.k, "inertia": e.inertia, "silhouette": e.silhouette} for e in evals]
     )
+    df_evals["algorithm"] = algorithm
+    df_evals["random_state"] = random_state
+    df_evals["is_final"] = df_evals["k"] == k_best
 
-    return {
+    meta = {
+        "algorithm": algorithm,
+        "random_state": random_state,
+        "k_values": k_values,
         "k_best": k_best,
-        "model": model,
-        "assignments": assign,
-        "centroids_z": dfZ,
-        "centroids_unstd": dfU,
-        "evals": df_evals,
+        "used_cols": used_cols,
     }
 
+    artifacts = {
+        "assignments": assignments,
+        "centroids_z": df_cz,
+        "centroids_unstd": df_cu,  # pode vir vazio se não for possível reconstruir (ver nota acima)
+        "evals": df_evals,
+        "model": model,
+        "k_best": k_best,
+        "meta": meta,
+    }
+    return artifacts
 
+
+# Versão explícita quando o SCALER é fornecido (recomendada para reconstruir centróides)
+def centroids_com_scaler(
+    model,
+    *,
+    scaler,
+    used_cols: List[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Helper explícito para reconstruir centróides com um StandardScaler conhecido.
+    """
+    return centroids_z_and_unstd(model, scaler=scaler, used_cols=used_cols)
+
+
+# =====================================================================
+# I/O de artefatos
+# =====================================================================
 def save_clustering_artifacts(
-    artifacts: Dict[str, pd.DataFrame | object | int],
-    output_dir: Path | str,
-) -> None:
+    artifacts: Dict[str, object],
+    outdir: Path | str,
+) -> Dict[str, Path]:
     """
-    Salva:
-      - assignments.parquet
-      - centroids_z.parquet
-      - centroids_unstd.parquet
-      - k_selection.csv
-      - modelo.joblib
+    Salva assignments, centróides e métricas em formato consistente:
+      - cluster_assignments.parquet
+      - cluster_centroids_z.parquet
+      - cluster_centroids_unstd.parquet
+      - k_selection_metrics.csv
+      - k_selection_metrics.parquet
+    Retorna os caminhos salvos.
     """
-    outdir = ensure_dir(output_dir)
-    # tabelas
-    save_parquet(artifacts["assignments"], outdir / "cluster_assignments.parquet")
-    save_parquet(artifacts["centroids_z"], outdir / "cluster_centroids_z.parquet")
-    save_parquet(artifacts["centroids_unstd"], outdir / "cluster_centroids_unstd.parquet")
-    artifacts["evals"].to_csv(outdir / "k_selection_metrics.csv", index=False)
-    # modelo
-    joblib.dump(artifacts["model"], outdir / "kmeans_model.joblib")
-    logger.info("Artefatos de clustering salvos em: %s", outdir)
+    outdir = Path(outdir)
+    ensure_dir(outdir)
+
+    paths: Dict[str, Path] = {}
+
+    # Assignments
+    if isinstance(artifacts.get("assignments"), pd.DataFrame):
+        paths["assignments_parquet"] = save_single_parquet(
+            artifacts["assignments"], outdir / "cluster_assignments.parquet"
+        )
+
+    # Centroids Z
+    if isinstance(artifacts.get("centroids_z"), pd.DataFrame):
+        paths["centroids_z_parquet"] = save_single_parquet(
+            artifacts["centroids_z"], outdir / "cluster_centroids_z.parquet"
+        )
+
+    # Centroids Unstd
+    if isinstance(artifacts.get("centroids_unstd"), pd.DataFrame):
+        paths["centroids_unstd_parquet"] = save_single_parquet(
+            artifacts["centroids_unstd"], outdir / "cluster_centroids_unstd.parquet"
+        )
+
+    # Métricas (CSV + Parquet)
+    if isinstance(artifacts.get("evals"), pd.DataFrame):
+        df_evals: pd.DataFrame = artifacts["evals"]
+        csv_path = outdir / "k_selection_metrics.csv"
+        df_evals.to_csv(csv_path, index=False)
+        paths["metrics_csv"] = csv_path
+
+        try:
+            paths["metrics_parquet"] = save_single_parquet(
+                df_evals, outdir / "k_selection_metrics.parquet"
+            )
+        except Exception as e:
+            logger.warning("Falha ao salvar métricas em Parquet (%s). Mantendo apenas CSV.", e)
+
+    return paths
+
+
+# =====================================================================
+# Leitura de features padronizadas (útil para pipelines externos)
+# =====================================================================
+def load_standardized_features(
+    parquet_path: Path | str,
+    *,
+    id_col: str = getattr(sc, "CONTACT_ID", "fk_contact"),
+    z_suffix: str = "_z",
+) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Lê o Parquet de features padronizadas e retorna:
+      - df_std
+      - used_cols (no espaço original, isto é, sem o sufixo _z)
+    """
+    parquet_path = Path(parquet_path)
+    if not parquet_path.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {parquet_path}")
+
+    df_std = pd.read_parquet(parquet_path, engine="pyarrow")
+    if id_col not in df_std.columns:
+        logger.warning("Coluna de id '%s' não encontrada. Prosseguindo sem id explícito.", id_col)
+
+    used_cols = [c[:-len(z_suffix)] for c in df_std.columns if c.endswith(z_suffix)]
+    if not used_cols:
+        raise ValueError(f"Nenhuma coluna '*{z_suffix}' encontrada em {parquet_path.name}.")
+
+    return df_std, used_cols
