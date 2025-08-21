@@ -71,14 +71,14 @@ def main():
                     df_window, start_date, build_date, end_date = windowing.build_observation_window(
                         df,
                         build_date=config.DEFAULT_BUILD_DATE,
-                        janela_meses=getattr(config, "WINDOW_MONTHS", 1),
+                        janela_meses=12,
                         post_filter_valid=True,
                         min_rows=1000,
                     )
                     windowing.save_window_parquet(
                         df_window,
                         out_dir=output_path,
-                        janela_meses=getattr(config, "WINDOW_MONTHS", 1),
+                        janela_meses=12,
                         filename_prefix="df_clean_window",
                     )
 
