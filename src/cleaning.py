@@ -36,7 +36,12 @@ def standardize_types(df: pd.DataFrame) -> pd.DataFrame:
             # tenta forçar o padrão HH:MM:SS adicionando ":00" quando vier HH:MM
             h = np.where(h.str.len() == 5, h + ":00", h)
             # quando vier vazio -> NaT
-            h = pd.to_datetime(h, errors="coerce", format="%H:%M:%S").dt.time
+            h = pd.to_datetime(h, errors="coerce", format="%H:%M:%S")
+            # Garante que seja Series antes de acessar .dt
+            if isinstance(h, pd.Series):
+                h = h.dt.time
+            else:
+                h = pd.Series(h).dt.time
             df[col] = h
 
     # numéricos (se o projeto mantiver mapa em sc.READ_DTYPES, isso já vem do loader;
