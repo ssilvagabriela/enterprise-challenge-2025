@@ -1,392 +1,414 @@
+# src/feature_builder.py
 from __future__ import annotations
+
 import logging
-from typing import Tuple, Dict, List
 from pathlib import Path
-from functools import reduce
+from typing import Tuple, Dict, List
 
 import numpy as np
 import pandas as pd
 
 from src import schema_config as sc
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+from src.io_saver import save_single_parquet
 
 logger = logging.getLogger(__name__)
 
 
-# ============================
-# Utilidades de tempo/labels
-# ============================
+# =========================================================
+# Utilidades
+# =========================================================
+def _coerce_build_date(build_date: str | pd.Timestamp) -> pd.Timestamp:
+    """Coage build_date para Timestamp naive (sem tz)."""
+    if isinstance(build_date, pd.Timestamp):
+        return build_date.tz_localize(None) if build_date.tzinfo else build_date
+    ts = pd.to_datetime(build_date, errors="raise")
+    return ts.tz_localize(None) if ts.tzinfo else ts
+
+
+def _group_apply_with_fallback(grouper, func):
+    """Compatibilidade com pandas antigos (sem include_groups)."""
+    try:
+        return grouper.apply(func, include_groups=False)
+    except TypeError:
+        return grouper.apply(func)
+
+
+def _top_and_share(s: pd.Series) -> Tuple[str | pd.NA, float]:
+    """Retorna (valor_top, share_top) considerando valores não nulos."""
+    if s.dropna().empty:
+        return pd.NA, 0.0
+    vc = s.value_counts(dropna=True)
+    top_val = vc.index[0]
+    share = float(vc.iloc[0] / vc.sum()) if vc.sum() > 0 else 0.0
+    return str(top_val), share
+
+
+def _safe_ratio(num: pd.Series, den: pd.Series) -> pd.Series:
+    den = den.replace({0: np.nan})
+    return (num / den).fillna(0.0)
+
+
+# =========================================================
+# Pré-processo temporal para sazonalidade
+# =========================================================
 def _ensure_timecols(df: pd.DataFrame) -> pd.DataFrame:
-    """Garante colunas auxiliares: month, quarter, season_br, daypart, is_festive_period."""
-    df = df.copy()
+    """
+    Garante colunas auxiliares para sazonalidade:
+      - month, quarter, season_br (verão/outono/inverno/primavera),
+      - daypart (madrugada, manhã, tarde, noite),
+      - is_weekend (se ainda não existir),
+      - is_holiday (janelas brasileiras simples: Natal/Reveillon, Carnaval, Junho).
+    """
+    out = df.copy()
+    time_col = sc.DATETIME_COL if sc.DATETIME_COL in out else sc.DATE_FALLBACK_COL
+    if time_col not in out:
+        raise KeyError(f"Coluna temporal '{sc.DATETIME_COL}' ou fallback '{sc.DATE_FALLBACK_COL}' ausente.")
 
-    time_col = sc.DATETIME_COL if sc.DATETIME_COL in df.columns else sc.DATE_FALLBACK_COL
-    if time_col not in df.columns:
-        raise ValueError(f"Não encontrei coluna temporal '{sc.DATETIME_COL}' nem fallback '{sc.DATE_FALLBACK_COL}'.")
+    out["month"] = out[time_col].dt.month.astype("Int8")
+    out["quarter"] = out[time_col].dt.quarter.astype("Int8")
 
-    if not pd.api.types.is_datetime64_any_dtype(df[time_col]):
-        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
-
-    df["month"] = df[time_col].dt.month.astype("Int8")
-    df["quarter"] = df[time_col].dt.quarter.astype("Int8")
-
-    # Estações do ano (Brasil, hemisfério sul):
-    # Verão: Dez(12), Jan(1), Fev(2); Outono: Mar(3), Abr(4), Mai(5)
-    # Inverno: Jun(6), Jul(7), Ago(8); Primavera: Set(9), Out(10), Nov(11)
-    season_map = {
-        12: "verao", 1: "verao", 2: "verao",
-        3: "outono", 4: "outono", 5: "outono",
-        6: "inverno", 7: "inverno", 8: "inverno",
-        9: "primavera", 10: "primavera", 11: "primavera",
-    }
-    df["season_br"] = df["month"].map(season_map).astype("string")
+    # Estações (hemisfério sul): Dez-Fev (verão), Mar-Mai (outono), Jun-Ago (inverno), Set-Nov (primavera)
+    month = out["month"]
+    season = pd.Series(index=out.index, dtype="string")
+    season[(month >= 12) | (month <= 2)] = "verao"
+    season[(month >= 3) & (month <= 5)] = "outono"
+    season[(month >= 6) & (month <= 8)] = "inverno"
+    season[(month >= 9) & (month <= 11)] = "primavera"
+    out["season_br"] = season.astype("string")
 
     # Daypart (madrugada 0-5, manhã 6-11, tarde 12-17, noite 18-23)
-    if sc.HOUR_COL in df.columns:
-        hour = df[sc.HOUR_COL].astype("Int16")
-    else:
-        hour = df[time_col].dt.hour.astype("Int16")
-
+    hour = out[time_col].dt.hour
     bins = [-1, 5, 11, 17, 23]
     labels = ["madrugada", "manha", "tarde", "noite"]
-    df["daypart"] = pd.cut(hour, bins=bins, labels=labels).astype("string")
+    out["daypart"] = pd.cut(hour, bins=bins, labels=labels).astype("string")
 
-    # Festividades (regras simples e replicáveis):
-    # - Natal/Reveillon: de 20/12 a 05/01 (qualquer ano)
-    # - Carnaval (aproximação): mês de fevereiro
-    # - Festas Juninas: mês de junho
-    dt = df[time_col]
-    month = dt.dt.month
-    day = dt.dt.day
-    natal_reveillon = ((month == 12) & (day >= 20)) | ((month == 1) & (day <= 5))
-    carnaval = (month == 2)
-    junho = (month == 6)
-    df["is_festive_period"] = (natal_reveillon | carnaval | junho).astype("Int8")
+    # is_weekend se não existe
+    if "is_weekend" not in out.columns:
+        out["is_weekend"] = out[time_col].dt.dayofweek.isin([5, 6]).astype("Int8")
 
-    # is_holiday: usar se existir (por ex., se criado antes no pipeline)
-    if "is_holiday" not in df.columns:
-        df["is_holiday"] = pd.NA  # manter coluna (pode ser preenchida em outra etapa)
+    # is_holiday (heurística simples e reproduzível)
+    # - Natal/Reveillon: 20/12..05/01
+    # - Carnaval: janela móvel simplificada (fev até início mar: 01/02..15/03)
+    # - Junho (festas juninas): 01/06..30/06
+    d = out[time_col]
+    mmdd = d.dt.strftime("%m-%d")
+    is_xmas_newyear = (mmdd >= "12-20") | (mmdd <= "01-05")
+    is_carnival = (mmdd >= "02-01") & (mmdd <= "03-15")
+    is_june = (mmdd >= "06-01") & (mmdd <= "06-30")
+    out["is_holiday"] = (is_xmas_newyear | is_carnival | is_june).astype("Int8")
 
-    return df
-
-
-def _share_of_top(value_counts: pd.Series) -> Tuple[str | pd.NA, float]:
-    """Retorna (categoria_top, share)."""
-    if value_counts.empty:
-        return pd.NA, 0.0
-    top_item = value_counts.index[0]
-    share = float(value_counts.iloc[0]) / float(value_counts.sum())
-    return top_item, share
+    return out
 
 
-# ============================
-# (A) RFM
-# ============================
-def build_rfm(df: pd.DataFrame, build_date: pd.Timestamp) -> pd.DataFrame:
+# =========================================================
+# Bloco A — RFM
+# =========================================================
+def build_rfm(df: pd.DataFrame, build_date: str | pd.Timestamp) -> pd.DataFrame:
     """
-    RFM no período da janela já recortada:
-      - last_purchase: max(date)
-      - frequency_12m: nº de pedidos distintos
-      - monetary_gmv_12m: soma de GMV
-      - recency_days: dias entre build_date e last_purchase
-      - avg_ticket_value: monetary / frequency
+    Retorna colunas:
+      - last_purchase (Timestamp),
+      - frequency_12m (nunique de pedidos),
+      - monetary_gmv_12m (soma),
+      - recency_days (build_date - last_purchase),
+      - avg_ticket_value (monetary / frequency).
     """
-    df = df.copy()
-    # garantias temporais básicas
-    time_col = sc.DATETIME_COL if sc.DATETIME_COL in df.columns else sc.DATE_FALLBACK_COL
-    if not pd.api.types.is_datetime64_any_dtype(df[time_col]):
-        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    bd = _coerce_build_date(build_date)
+    time_col = sc.DATETIME_COL if sc.DATETIME_COL in df else sc.DATE_FALLBACK_COL
+    key_col = getattr(sc, "PRIMARY_KEY", "nk_ota_localizer_id")
 
-    g = df.groupby(sc.CONTACT_ID, as_index=False)
+    g = df.groupby(sc.CONTACT_ID, observed=True)
+    rfm = g.agg(
+        last_purchase=(time_col, "max"),
+        frequency_12m=(key_col, "nunique"),
+        monetary_gmv_12m=(sc.GMV_COL, "sum"),
+    ).reset_index()
 
-    # nº único de pedidos (usando chave de pedido)
-    order_key = sc.PRIMARY_KEY if hasattr(sc, "PRIMARY_KEY") else "nk_ota_localizer_id"
-    freq = g[order_key].nunique().rename(columns={order_key: "frequency_12m"})
-
-    # soma do GMV
-    mon = g[sc.GMV_COL].sum().rename(columns={sc.GMV_COL: "monetary_gmv_12m"})
-
-    # last_purchase
-    last = g[time_col].max().rename(columns={time_col: "last_purchase"})
-
-    rfm = freq.merge(mon, on=sc.CONTACT_ID, how="outer").merge(last, on=sc.CONTACT_ID, how="outer")
-
-    # recency e ticket médio
-    rfm["recency_days"] = (pd.to_datetime(build_date) - rfm["last_purchase"]).dt.days
-    rfm["avg_ticket_value"] = np.where(rfm["frequency_12m"] > 0, rfm["monetary_gmv_12m"] / rfm["frequency_12m"], np.nan)
-
+    rfm["recency_days"] = (bd - rfm["last_purchase"]).dt.days.astype("Int32")
+    rfm["avg_ticket_value"] = np.where(
+        rfm["frequency_12m"] > 0,
+        rfm["monetary_gmv_12m"] / rfm["frequency_12m"],
+        np.nan,
+    )
     return rfm
 
 
-# ============================
-# (B) Estrutura de viagem
-# ============================
+# =========================================================
+# Bloco B — Estrutura de viagem (ida/volta e rotas)
+# =========================================================
 def build_trip_structure(df: pd.DataFrame) -> pd.DataFrame:
     """
-    - pct_round_trip: média(has_return)
-    - n_unique_routes_out: nº de route_out distintos
-    - top_route_out, top_route_out_share
+    Retorna por cliente:
+      - pct_round_trip,
+      - n_unique_routes_out,
+      - top_route_out,
+      - top_route_out_share.
     """
-    df = df.copy()
+    def _agg(g: pd.DataFrame) -> pd.Series:
+        pct_round = g[sc.HAS_RETURN_COL].fillna(0).astype("Int8").mean() if sc.HAS_RETURN_COL in g else 0.0
+        n_routes = g[sc.ROUTE_OUT_COL].nunique(dropna=True) if sc.ROUTE_OUT_COL in g else 0
+        top, share = _top_and_share(g[sc.ROUTE_OUT_COL]) if sc.ROUTE_OUT_COL in g else (pd.NA, 0.0)
+        return pd.Series(
+            {
+                "pct_round_trip": float(pct_round),
+                "n_unique_routes_out": int(n_routes),
+                "top_route_out": top,
+                "top_route_out_share": float(share),
+            }
+        )
 
-    def _agg(group: pd.DataFrame) -> pd.Series:
-        pct_round = group[sc.HAS_RETURN_COL].astype(float).mean() if sc.HAS_RETURN_COL in group else 0.0
-        routes = group[sc.ROUTE_OUT_COL].dropna().astype(str)
-        n_routes = routes.nunique()
-        top_route, top_share = _share_of_top(routes.value_counts())
-        return pd.Series({
-            "pct_round_trip": float(pct_round) if not np.isnan(pct_round) else 0.0,
-            "n_unique_routes_out": int(n_routes),
-            "top_route_out": top_route,
-            "top_route_out_share": float(top_share),
-        })
-
-    # <<< AQUI: observed=True e include_groups=False >>>
-    out = (
-        df.groupby(sc.CONTACT_ID, observed=True)
-          .apply(_agg, include_groups=False)
-          .reset_index()
-    )
+    out = _group_apply_with_fallback(df.groupby(sc.CONTACT_ID, observed=True), _agg).reset_index()
+    # Tipos estáveis
+    out["pct_round_trip"] = out["pct_round_trip"].astype("float64")
+    out["n_unique_routes_out"] = out["n_unique_routes_out"].astype("Int32")
+    out["top_route_out_share"] = out["top_route_out_share"].astype("float64")
+    out["top_route_out"] = out["top_route_out"].astype("string")
     return out
 
 
-# ============================
-# (C) Companhia preferida
-# ============================
+# =========================================================
+# Bloco C — Companhia preferida (ida)
+# =========================================================
 def build_company_pref(df: pd.DataFrame) -> pd.DataFrame:
     """
-    - top_company_out, top_company_out_share
+    Retorna por cliente:
+      - top_company_out,
+      - top_company_out_share.
     """
-    df = df.copy()
+    def _agg(g: pd.DataFrame) -> pd.Series:
+        if sc.COMPANY_OUT_COL in g:
+            top, share = _top_and_share(g[sc.COMPANY_OUT_COL])
+        else:
+            top, share = (pd.NA, 0.0)
+        return pd.Series(
+            {"top_company_out": top, "top_company_out_share": float(share)}
+        )
 
-    def _agg(group: pd.DataFrame) -> pd.Series:
-        comp = group[sc.COMPANY_OUT_COL].dropna().astype(str)
-        top_company, top_share = _share_of_top(comp.value_counts())
-        return pd.Series({
-            "top_company_out": top_company,
-            "top_company_out_share": float(top_share),
-        })
-
-    # <<< AQUI: observed=True e include_groups=False >>>
-    out = (
-        df.groupby(sc.CONTACT_ID, observed=True)
-          .apply(_agg, include_groups=False)
-          .reset_index()
-    )
+    out = _group_apply_with_fallback(df.groupby(sc.CONTACT_ID, observed=True), _agg).reset_index()
+    out["top_company_out"] = out["top_company_out"].astype("string")
+    out["top_company_out_share"] = out["top_company_out_share"].astype("float64")
     return out
 
 
-# ============================
-# (D) Sazonalidade
-# ============================
+# =========================================================
+# Bloco D — Sazonalidade (percentuais)
+# =========================================================
 def build_seasonality(df: pd.DataFrame) -> pd.DataFrame:
     """
-    - pct_weekend_purchases
-    - pct_q1..pct_q4
-    - pct_verao..pct_primavera
-    - pct_madrugada..pct_noite
-    - pct_holiday_purchases, pct_festive_period_purchases
+    Retorna por cliente os percentuais (0..1):
+      - pct_weekend,
+      - pct_q1, pct_q2, pct_q3, pct_q4,
+      - pct_verao, pct_outono, pct_inverno, pct_primavera,
+      - pct_madrugada, pct_manha, pct_tarde, pct_noite,
+      - pct_holiday.
+    Garante presença de todas as colunas, com 0.0 quando categoria não ocorre.
     """
-    df = _ensure_timecols(df)
+    x = _ensure_timecols(df)
 
-    def _proportions(series: pd.Series, categories: List[str]) -> Dict[str, float]:
-        vc = series.value_counts(normalize=True)
-        return {cat: float(vc.get(cat, 0.0)) for cat in categories}
+    # Base de contagem por cliente
+    g = x.groupby(sc.CONTACT_ID, observed=True)
+    total = g.size().rename("n").reset_index()
 
-    # base de proporções
-    grp = df.groupby(sc.CONTACT_ID)
-
-    # fim de semana
-    if sc.WEEKEND_COL in df:
-        weekend_mean = grp[sc.WEEKEND_COL].mean().rename("pct_weekend_purchases").fillna(0.0)
-    else:
-        weekend_mean = pd.Series(0.0, index=grp.size().index, name="pct_weekend_purchases")
+    # weekend
+    weekend = x.groupby(sc.CONTACT_ID, observed=True)["is_weekend"].mean().rename("pct_weekend").reset_index()
 
     # quarter
-    quarter_props = grp["quarter"].apply(
-        lambda s: pd.Series(_proportions(s.astype("Int8").astype(str),
-                                         categories=["1", "2", "3", "4"]))
-        .rename(index={"1": "pct_q1", "2": "pct_q2", "3": "pct_q3", "4": "pct_q4"})
-    ).reset_index()
+    q_share = (
+        x.groupby([sc.CONTACT_ID, "quarter"], observed=True)
+        .size()
+        .groupby(level=0)
+        .apply(lambda s: s / s.sum())
+        .rename("share")
+        .reset_index()
+    )
+    q_pivot = q_share.pivot(index=sc.CONTACT_ID, columns="quarter", values="share").fillna(0.0)
+    q_pivot = q_pivot.rename(columns={1: "pct_q1", 2: "pct_q2", 3: "pct_q3", 4: "pct_q4"}).reset_index()
 
-    # season (Brasil)
-    seasons = ["verao", "outono", "inverno", "primavera"]
-    season_props = grp["season_br"].apply(
-        lambda s: pd.Series(_proportions(s, categories=seasons))
-        .rename(index={f: f"pct_{f}" for f in seasons})
-    ).reset_index()
+    # season_br
+    s_share = (
+        x.groupby([sc.CONTACT_ID, "season_br"], observed=True)
+        .size()
+        .groupby(level=0)
+        .apply(lambda s: s / s.sum())
+        .rename("share")
+        .reset_index()
+    )
+    s_pivot = s_share.pivot(index=sc.CONTACT_ID, columns="season_br", values="share").fillna(0.0)
+    s_pivot = (
+        s_pivot.rename(
+            columns={
+                "verao": "pct_verao",
+                "outono": "pct_outono",
+                "inverno": "pct_inverno",
+                "primavera": "pct_primavera",
+            }
+        )
+        .reindex(columns=["pct_verao", "pct_outono", "pct_inverno", "pct_primavera"], fill_value=0.0)
+        .reset_index()
+    )
 
     # daypart
-    dayparts = ["madrugada", "manha", "tarde", "noite"]
-    daypart_props = grp["daypart"].apply(
-        lambda s: pd.Series(_proportions(s, categories=dayparts))
-        .rename(index={f: f"pct_{f}" for f in dayparts})
-    ).reset_index()
+    d_share = (
+        x.groupby([sc.CONTACT_ID, "daypart"], observed=True)
+        .size()
+        .groupby(level=0)
+        .apply(lambda s: s / s.sum())
+        .rename("share")
+        .reset_index()
+    )
+    d_pivot = d_share.pivot(index=sc.CONTACT_ID, columns="daypart", values="share").fillna(0.0)
+    d_pivot = (
+        d_pivot.rename(
+            columns={
+                "madrugada": "pct_madrugada",
+                "manha": "pct_manha",
+                "tarde": "pct_tarde",
+                "noite": "pct_noite",
+            }
+        )
+        .reindex(columns=["pct_madrugada", "pct_manha", "pct_tarde", "pct_noite"], fill_value=0.0)
+        .reset_index()
+    )
 
-    # holiday / festive
-    # Nota: is_holiday pode conter NA; tratamos como 0 para média
-    if "is_holiday" in df.columns:
-        holiday_mean = grp["is_holiday"].apply(
-            lambda s: pd.to_numeric(s, errors="coerce")  # garante numérico
-                        .fillna(0)                      # preenche como 0
-                        .astype("Int8")                 # tipo inteiro pequeno
-                        .mean()
-        ).rename("pct_holiday_purchases")
+    # holiday
+    if "is_holiday" in x.columns:
+        hol = (
+            x.groupby(sc.CONTACT_ID, observed=True)["is_holiday"]
+            .mean()
+            .rename("pct_holiday")
+            .reset_index()
+        )
     else:
-        holiday_mean = pd.Series(0.0, index=grp.size().index, name="pct_holiday_purchases")
+        hol = total[[sc.CONTACT_ID]].copy()
+        hol["pct_holiday"] = 0.0
 
-    festive_mean = grp["is_festive_period"].mean().rename("pct_festive_period_purchases").fillna(0.0)
+    # Merge final
+    out = (
+        total[[sc.CONTACT_ID]]
+        .merge(weekend, on=sc.CONTACT_ID, how="left")
+        .merge(q_pivot, on=sc.CONTACT_ID, how="left")
+        .merge(s_pivot, on=sc.CONTACT_ID, how="left")
+        .merge(d_pivot, on=sc.CONTACT_ID, how="left")
+        .merge(hol, on=sc.CONTACT_ID, how="left")
+        .fillna(0.0)
+    )
 
-    # juntar tudo
-    saz = weekend_mean.reset_index()
-    for part in [quarter_props, season_props, daypart_props, holiday_mean.reset_index(), festive_mean.reset_index()]:
-        saz = saz.merge(part, on=sc.CONTACT_ID, how="left")
-
-    # preencher ausências com 0
-    saz = saz.fillna(0.0)
-
-    return saz
+    # Tipos estáveis
+    pct_cols = [c for c in out.columns if c.startswith("pct_")]
+    out[pct_cols] = out[pct_cols].astype("float64")
+    return out
 
 
-# ============================
-# (E) Intensidade
-# ============================
+# =========================================================
+# Bloco E — Intensidade
+# =========================================================
 def build_intensity(df: pd.DataFrame) -> pd.DataFrame:
     """
-    - total_tickets_12m = soma(total_tickets_quantity_success)
-    - avg_price_per_ticket = monetary_gmv_12m / total_tickets_12m
+    Retorna por cliente:
+      - total_tickets_12m,
+      - avg_price_per_ticket (média no período).
     """
-    g = df.groupby(sc.CONTACT_ID, as_index=False)
+    g = df.groupby(sc.CONTACT_ID, observed=True)
+    inten = g.agg(
+        total_tickets_12m=(sc.TICKETS_COL, "sum"),
+        avg_price_per_ticket=("avg_price_per_ticket", "mean" if "avg_price_per_ticket" in df else (sc.GMV_COL, "mean")),
+    ).reset_index()
 
-    tickets = g[sc.TICKETS_COL].sum().rename(columns={sc.TICKETS_COL: "total_tickets_12m"})
-    gmv = g[sc.GMV_COL].sum().rename(columns={sc.GMV_COL: "monetary_gmv_12m"})
-
-    inten = tickets.merge(gmv, on=sc.CONTACT_ID, how="outer")
-    inten["avg_price_per_ticket"] = np.where(
-        inten["total_tickets_12m"] > 0,
-        inten["monetary_gmv_12m"] / inten["total_tickets_12m"],
-        np.nan,
-    )
+    # Tipagem consistente
+    inten["total_tickets_12m"] = pd.to_numeric(inten["total_tickets_12m"], errors="coerce").fillna(0).astype("Int64")
+    inten["avg_price_per_ticket"] = pd.to_numeric(inten["avg_price_per_ticket"], errors="coerce").astype("float64")
     return inten
 
-def _ensure_unique_per_contact(df: pd.DataFrame, block_name: str) -> pd.DataFrame:
-    """Se houver múltiplas linhas por fk_contact em um bloco, agrega por first()."""
-    if df.duplicated(subset=[sc.CONTACT_ID]).any():
-        logging.warning(f"{block_name}: múltiplas linhas por cliente; agregando por first().")
-        df = (
-            df.sort_values(sc.CONTACT_ID)
-              .groupby(sc.CONTACT_ID, as_index=False, sort=False)
-              .first()
-        )
-    return df
 
-def _ensure_unique_by_contact(df: pd.DataFrame, where: str) -> pd.DataFrame:
+# =========================================================
+# Orquestrador de features
+# =========================================================
+def _postprocess_and_fill(df_feat: pd.DataFrame) -> pd.DataFrame:
     """
-    Garante 1 linha por fk_contact. Se houver múltiplas, agrega por first()
-    e loga um aviso. Mantém a ordem de colunas recebida.
+    Preenche ausências/NaN de forma controlada e garante tipos consistentes.
+    - Campos de proporção/percentual: float64
+    - Contagens/somas: Int64 quando apropriado
     """
-    if df.duplicated(subset=[sc.CONTACT_ID]).any():
-        logger.warning("%s: múltiplas linhas por cliente; agregando por first().", where)
-        # agrega por first mantendo somente a primeira ocorrência de cada coluna
-        df = (df.groupby(sc.CONTACT_ID, as_index=False, sort=False)
-                .first())
-    return df
+    out = df_feat.copy()
+
+    # Preencher ausências em colunas específicas
+    zero_fill_cols = [c for c in out.columns if c.startswith("pct_")] + [
+        "n_unique_routes_out",
+        "frequency_12m",
+        "total_tickets_12m",
+        "top_route_out_share",
+        "top_company_out_share",
+    ]
+    for c in zero_fill_cols:
+        if c in out:
+            if c.startswith("pct_") or c.endswith("_share"):
+                out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).astype("float64")
+            elif c in {"n_unique_routes_out", "frequency_12m", "total_tickets_12m"}:
+                out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype("Int64")
+
+    # Coerções finais
+    float_cols = ["monetary_gmv_12m", "avg_ticket_value", "avg_price_per_ticket", "pct_round_trip"]
+    for c in float_cols:
+        if c in out:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
+
+    # Strings amigáveis
+    for c in ["top_route_out", "top_company_out"]:
+        if c in out:
+            out[c] = out[c].astype("string")
+
+    return out
 
 
-def _safe_fill_zeros(feats: pd.DataFrame, patterns: List[str]) -> pd.DataFrame:
-    """
-    Preenche com 0.0 apenas colunas existentes que casem pelos padrões:
-    - começa com 'pct_' OU termina com '_12m' OU começa com 'n_unique_'
-    """
-    if feats.empty:
-        return feats
-
-    cols = []
-    for c in feats.columns:
-        if c == sc.CONTACT_ID:
-            continue
-        if c.startswith("pct_") or c.endswith("_12m") or c.startswith("n_unique_"):
-            cols.append(c)
-
-    if cols:
-        # usa .loc e interseção para evitar desalinhamento
-        feats.loc[:, cols] = feats.loc[:, cols].fillna(0.0)
-    return feats
-
-
-def _coerce_numeric_safely(feats: pd.DataFrame, prefix: str) -> pd.DataFrame:
-    """
-    Converte para numérico as colunas que começam com determinado prefixo (ex.: 'pct_'),
-    usando conversão coluna a coluna (evita FutureWarning em apply(errors='ignore')).
-    """
-    target_cols = [c for c in feats.columns if c.startswith(prefix)]
-    for c in target_cols:
-        feats[c] = pd.to_numeric(feats[c], errors="coerce")
-    return feats
-
-# ============================
-# Orquestração
-# ============================
 def build_customer_features(
-    df_cf: pd.DataFrame,
+    df_window: pd.DataFrame,
+    *,
     build_date: str | pd.Timestamp,
     model_version: str = "v1",
 ) -> pd.DataFrame:
-    bd = pd.to_datetime(build_date)
+    """
+    Constrói todas as features por cliente a partir do df_window (janela já aplicada).
+    Retorna um único DataFrame (1 linha por fk_contact).
+    """
+    if sc.CONTACT_ID not in df_window.columns:
+        raise KeyError(f"Coluna de cliente '{sc.CONTACT_ID}' ausente no df_window.")
 
-    # --- (A) RFM ---
-    rfm = build_rfm(df_cf, bd)
-    rfm = _ensure_unique_by_contact(rfm, "rfm")
+    # Blocos
+    rfm = build_rfm(df_window, build_date=build_date)
+    trip = build_trip_structure(df_window)
+    comp = build_company_pref(df_window)
+    seas = build_seasonality(df_window)
+    inten = build_intensity(df_window)
 
-    # --- (B) Estrutura de viagem ---
-    trip = build_trip_structure(df_cf)
-    trip = _ensure_unique_by_contact(trip, "trip_structure")
+    # Merge final
+    feats = (
+        rfm.merge(trip, on=sc.CONTACT_ID, how="left")
+           .merge(comp, on=sc.CONTACT_ID, how="left")
+           .merge(seas, on=sc.CONTACT_ID, how="left")
+           .merge(inten, on=sc.CONTACT_ID, how="left")
+    )
 
-    # --- (C) Companhia preferida ---
-    comp = build_company_pref(df_cf)
-    comp = _ensure_unique_by_contact(comp, "company_pref")
-
-    # --- (D) Sazonalidade ---
-    saz = build_seasonality(df_cf)
-    saz = _ensure_unique_by_contact(saz, "seasonality")
-
-    # --- (E) Intensidade ---
-    inten = build_intensity(df_cf)
-    inten = _ensure_unique_by_contact(inten, "intensity")
-
-    # --- Merge incremental por fk_contact ---
-    parts = [rfm, trip, comp, saz, inten]
-    feats = parts[0]
-    for part in parts[1:]:
-        feats = feats.merge(part, on=sc.CONTACT_ID, how="outer", copy=False)
-
-    # Garantir que fk_contact seja único após todos os merges
-    feats = _ensure_unique_by_contact(feats, "final_merge")
-
-    # Preencher zeros somente onde faz sentido (proporções/contagens)
-    feats = _safe_fill_zeros(feats, patterns=["pct_", "_12m", "n_unique_"])
-
-    # Coagir colunas pct_* para numérico (evita strings como "0.0")
-    feats = _coerce_numeric_safely(feats, prefix="pct_")
-
-    # Meta-infos
+    # Metadados do modelo
+    bd = _coerce_build_date(build_date)
     feats["build_date"] = bd.normalize()
-    feats["model_version"] = model_version
+    feats["model_version"] = str(model_version)
 
-    # Ordena colunas: id, metas, depois features (só estética)
-    meta_cols = [sc.CONTACT_ID, "build_date", "model_version"]
-    other_cols = [c for c in feats.columns if c not in meta_cols]
-    feats = feats[meta_cols + other_cols]
+    # Pós-processo (tipos e fills)
+    feats = _postprocess_and_fill(feats)
 
-    logger.info("feats shape: %s", feats.shape)
-    logger.info("contatos únicos: %d", feats[sc.CONTACT_ID].nunique())
-
+    # Garantir 1 linha por cliente
+    feats = feats.drop_duplicates(subset=[sc.CONTACT_ID], keep="first").reset_index(drop=True)
+    logger.info("Customer features construídas: %d clientes, %d colunas", feats.shape[0], feats.shape[1])
     return feats
 
 
-def save_customer_features(df_feats: pd.DataFrame, out_path: Path, compression: str = "snappy") -> Path:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df_feats.to_parquet(out_path, index=False, compression=compression, engine="pyarrow")
-    logging.info(f"Features por cliente salvas em: {out_path}")
-    return out_path
+# =========================================================
+# Salvamento
+# =========================================================
+def save_customer_features(
+    df_feats: pd.DataFrame,
+    out_path: Path,
+    *,
+    compression: str = "snappy",
+) -> Path:
+    """Salva features em Parquet com escrita segura."""
+    return save_single_parquet(df_feats, out_path, compression=compression)
