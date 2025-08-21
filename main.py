@@ -5,7 +5,7 @@ import sys
 
 import pandas as pd
 
-from src import data_loader, cleaning
+from src import data_loader, cleaning, io_saver
 from src import config
 
 # Configuração básica de logging
@@ -27,13 +27,23 @@ def main():
         # 2) Rodar pipeline de limpeza
         results = cleaning.run_cleaning_pipeline(df_raw, tz=config.TIMEZONE)
 
-        # 3) Salvar resultados em parquet/csv
+        # 3) Salvar resultados
         output_path = config.RUN_OUTPUT_PATH
         for name, df in results.items():
             if isinstance(df, pd.DataFrame):
-                file_path = output_path / f"{name}.parquet"
-                df.to_parquet(file_path, index=False)
-                logger.info("Resultado salvo em %s (%d linhas)", file_path, len(df))
+                # Exemplo: salva todos como parquet seguro
+                out_file = output_path / f"{name}.parquet"
+                io_saver.save_single_parquet(df, out_file)
+
+                # Para o df_clean, também gera versão particionada (ano/mês)
+                if name == "df_clean":
+                    io_saver.save_partitioned_by_year(
+                        df,
+                        root_dir=output_path,
+                        dataset_name="df_clean_partitioned",
+                        partition_cols=["year", "month"],
+                        overwrite=True,
+                    )
 
         logger.info("Pipeline concluído com sucesso!")
 
