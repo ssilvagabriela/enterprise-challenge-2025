@@ -14,6 +14,7 @@ from src import (
     feature_builder,
     standardizer,
     cluster_trainer,
+    cluster_labeler,   # << novo
     config,
 )
 
@@ -182,14 +183,21 @@ def main():
                             model, scaler=scaler, used_cols=used_cols
                         )
 
-                        # 7.5 Montar artifacts e salvar
+                        # 7.5 Métricas de avaliação (DataFrame)
+                        metrics_df = pd.DataFrame(
+                            [{"k": e.k, "inertia": e.inertia, "silhouette": e.silhouette} for e in evals]
+                        ).assign(
+                            algorithm=algorithm,
+                            random_state=random_state,
+                            is_final=lambda d: d["k"] == k_best
+                        )
+
+                        # 7.6 Montar artifacts e salvar
                         artifacts = {
                             "assignments": assignments,
                             "centroids_z": cent_z,
                             "centroids_unstd": cent_unstd,
-                            "evals": pd.DataFrame(
-                                [{"k": e.k, "inertia": e.inertia, "silhouette": e.silhouette} for e in evals]
-                            ).assign(algorithm=algorithm, random_state=random_state, is_final=lambda d: d["k"] == k_best),
+                            "evals": metrics_df,
                             "model": model,
                             "k_best": k_best,
                             "meta": {
@@ -208,8 +216,41 @@ def main():
                         for k, p in paths.items():
                             logger.info(" - %s: %s", k, p)
 
+                        # ===========================
+                        # 8) Rotulagem e nomes (cluster_labeler.py)
+                        # ===========================
+                        low_thr = getattr(config, "LABEL_LOW_THR", -0.5)
+                        high_thr = getattr(config, "LABEL_HIGH_THR", 0.5)
+                        max_frag = getattr(config, "LABEL_MAX_FRAGMENTS", 3)
+
+                        label_outputs = cluster_labeler.run_labeling_pipeline(
+                            centroids_z=cent_z,
+                            used_cols=used_cols,
+                            assignments=assignments,
+                            centroids_unstd=cent_unstd,
+                            metrics=metrics_df,
+                            cluster_id_col="cluster_id",
+                            id_col=id_col,
+                            low_thr=low_thr,
+                            high_thr=high_thr,
+                            max_fragments=max_frag,
+                            aliases=getattr(config, "LABEL_ALIASES", None),
+                            priority=getattr(config, "LABEL_PRIORITY", None),
+                            meta=artifacts.get("meta", None),
+                        )
+
+                        labels_dir = cluster_outdir / "labels"
+                        label_paths = cluster_labeler.save_labeling_outputs(
+                            label_outputs,
+                            labels_dir,
+                            save_csv_extras=True,
+                        )
+                        logger.info("Artefatos de rotulagem salvos em: %s", labels_dir)
+                        for k, p in label_paths.items():
+                            logger.info(" - %s: %s", k, p)
+
                     except Exception as e_clu:
-                        logger.exception("Falha na etapa de clustering: %s", e_clu)
+                        logger.exception("Falha na etapa de clustering/rotulagem: %s", e_clu)
                         raise
 
         logger.info("Pipeline concluído com sucesso!")
