@@ -75,3 +75,31 @@ def save_partitioned_by_year(
         logging.info(f"Salvo: {out_file} ({g.shape[0]} linhas)")
 
     return target_root
+
+def ensure_dir(path: str | Path) -> Path:
+    """
+    Garante que o diretório existe. 
+    Se não existir, cria recursivamente.
+    Retorna o Path normalizado.
+    """
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def save_parquet(df: pd.DataFrame, path: str | Path, **kwargs) -> None:
+    """
+    Salva DataFrame em formato Parquet, garantindo que o diretório exista.
+    """
+    path = Path(path)
+    ensure_dir(path.parent)
+    df.to_parquet(path, index=False, **kwargs)
+
+
+def save_csv(df: pd.DataFrame, path: str | Path, **kwargs) -> None:
+    """
+    Salva DataFrame em formato CSV, garantindo que o diretório exista.
+    """
+    path = Path(path)
+    ensure_dir(path.parent)
+    df.to_csv(path, index=False, **kwargs)

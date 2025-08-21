@@ -11,6 +11,8 @@ from src import schema_config as sc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+logger = logging.getLogger(__name__)
+
 
 # ============================
 # Utilidades de tempo/labels
@@ -279,6 +281,49 @@ def _ensure_unique_per_contact(df: pd.DataFrame, block_name: str) -> pd.DataFram
         )
     return df
 
+def _ensure_unique_by_contact(df: pd.DataFrame, where: str) -> pd.DataFrame:
+    """
+    Garante 1 linha por fk_contact. Se houver múltiplas, agrega por first()
+    e loga um aviso. Mantém a ordem de colunas recebida.
+    """
+    if df.duplicated(subset=[sc.CONTACT_ID]).any():
+        logger.warning("%s: múltiplas linhas por cliente; agregando por first().", where)
+        # agrega por first mantendo somente a primeira ocorrência de cada coluna
+        df = (df.groupby(sc.CONTACT_ID, as_index=False, sort=False)
+                .first())
+    return df
+
+
+def _safe_fill_zeros(feats: pd.DataFrame, patterns: List[str]) -> pd.DataFrame:
+    """
+    Preenche com 0.0 apenas colunas existentes que casem pelos padrões:
+    - começa com 'pct_' OU termina com '_12m' OU começa com 'n_unique_'
+    """
+    if feats.empty:
+        return feats
+
+    cols = []
+    for c in feats.columns:
+        if c == sc.CONTACT_ID:
+            continue
+        if c.startswith("pct_") or c.endswith("_12m") or c.startswith("n_unique_"):
+            cols.append(c)
+
+    if cols:
+        # usa .loc e interseção para evitar desalinhamento
+        feats.loc[:, cols] = feats.loc[:, cols].fillna(0.0)
+    return feats
+
+
+def _coerce_numeric_safely(feats: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """
+    Converte para numérico as colunas que começam com determinado prefixo (ex.: 'pct_'),
+    usando conversão coluna a coluna (evita FutureWarning em apply(errors='ignore')).
+    """
+    target_cols = [c for c in feats.columns if c.startswith(prefix)]
+    for c in target_cols:
+        feats[c] = pd.to_numeric(feats[c], errors="coerce")
+    return feats
 
 # ============================
 # Orquestração
@@ -290,47 +335,52 @@ def build_customer_features(
 ) -> pd.DataFrame:
     bd = pd.to_datetime(build_date)
 
-    # (A) RFM
-    rfm = _ensure_unique_per_contact(build_rfm(df_cf, bd), "rfm")
+    # --- (A) RFM ---
+    rfm = build_rfm(df_cf, bd)
+    rfm = _ensure_unique_by_contact(rfm, "rfm")
 
-    # (B) Estrutura de viagem
-    trip = _ensure_unique_per_contact(build_trip_structure(df_cf), "trip_structure")
+    # --- (B) Estrutura de viagem ---
+    trip = build_trip_structure(df_cf)
+    trip = _ensure_unique_by_contact(trip, "trip_structure")
 
-    # (C) Companhia preferida
-    comp = _ensure_unique_per_contact(build_company_pref(df_cf), "company_pref")
+    # --- (C) Companhia preferida ---
+    comp = build_company_pref(df_cf)
+    comp = _ensure_unique_by_contact(comp, "company_pref")
 
-    # (D) Sazonalidade
-    saz = _ensure_unique_per_contact(build_seasonality(df_cf), "seasonality")
+    # --- (D) Sazonalidade ---
+    saz = build_seasonality(df_cf)
+    saz = _ensure_unique_by_contact(saz, "seasonality")
 
-    # (E) Intensidade
-    inten = _ensure_unique_per_contact(build_intensity(df_cf), "intensity")
+    # --- (E) Intensidade ---
+    inten = build_intensity(df_cf)
+    inten = _ensure_unique_by_contact(inten, "intensity")
 
-    # --- merge outer por fk_contact
+    # --- Merge incremental por fk_contact ---
     parts = [rfm, trip, comp, saz, inten]
-    feats = reduce(lambda L, R: L.merge(R, on=sc.CONTACT_ID, how="outer"), parts)
+    feats = parts[0]
+    for part in parts[1:]:
+        feats = feats.merge(part, on=sc.CONTACT_ID, how="outer", copy=False)
 
-    # --- preencher zeros apenas onde faz sentido
-    # máscara booleana de COLUNAS (usar .loc[:, mask]!)
-    prop_mask = (
-        feats.columns.str.startswith("pct_") |
-        feats.columns.str.endswith("_12m") |
-        feats.columns.str.startswith("n_unique_")
-    )
-    cols_to_zero = feats.columns[prop_mask]
+    # Garantir que fk_contact seja único após todos os merges
+    feats = _ensure_unique_by_contact(feats, "final_merge")
 
-    # garantir colunas numéricas onde possível antes do fillna
-    feats.loc[:, cols_to_zero] = (
-        feats.loc[:, cols_to_zero]
-             .apply(pd.to_numeric, errors="ignore")
-             .fillna(0.0)
-    )
+    # Preencher zeros somente onde faz sentido (proporções/contagens)
+    feats = _safe_fill_zeros(feats, patterns=["pct_", "_12m", "n_unique_"])
 
-    # meta-infos
+    # Coagir colunas pct_* para numérico (evita strings como "0.0")
+    feats = _coerce_numeric_safely(feats, prefix="pct_")
+
+    # Meta-infos
     feats["build_date"] = bd.normalize()
     feats["model_version"] = model_version
 
-    # opcional: ordenar por chave
-    feats = feats.sort_values(sc.CONTACT_ID).reset_index(drop=True)
+    # Ordena colunas: id, metas, depois features (só estética)
+    meta_cols = [sc.CONTACT_ID, "build_date", "model_version"]
+    other_cols = [c for c in feats.columns if c not in meta_cols]
+    feats = feats[meta_cols + other_cols]
+
+    logger.info("feats shape: %s", feats.shape)
+    logger.info("contatos únicos: %d", feats[sc.CONTACT_ID].nunique())
 
     return feats
 
