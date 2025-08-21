@@ -204,98 +204,86 @@ def build_seasonality(df: pd.DataFrame) -> pd.DataFrame:
     """
     x = _ensure_timecols(df)
 
-    # Base de contagem por cliente
-    g = x.groupby(sc.CONTACT_ID, observed=True)
-    total = g.size().rename("n").reset_index()
+    # === Quarter (participação por trimestre) ===
+    q_tab = pd.crosstab(
+        x[sc.CONTACT_ID],
+        x["quarter"],
+        normalize="index",
+        dropna=False,
+    ).fillna(0.0)
+    q_tab = q_tab.reindex(columns=[1, 2, 3, 4], fill_value=0.0)
+    q_tab = q_tab.rename(columns={1: "pct_q1", 2: "pct_q2", 3: "pct_q3", 4: "pct_q4"})
 
-    # weekend
-    weekend = x.groupby(sc.CONTACT_ID, observed=True)["is_weekend"].mean().rename("pct_weekend").reset_index()
-
-    # quarter
-    q_share = (
-        x.groupby([sc.CONTACT_ID, "quarter"], observed=True)
-        .size()
-        .groupby(level=0)
-        .apply(lambda s: s / s.sum())
-        .rename("share")
-        .reset_index()
-    )
-    q_pivot = q_share.pivot(index=sc.CONTACT_ID, columns="quarter", values="share").fillna(0.0)
-    q_pivot = q_pivot.rename(columns={1: "pct_q1", 2: "pct_q2", 3: "pct_q3", 4: "pct_q4"}).reset_index()
-
-    # season_br
-    s_share = (
-        x.groupby([sc.CONTACT_ID, "season_br"], observed=True)
-        .size()
-        .groupby(level=0)
-        .apply(lambda s: s / s.sum())
-        .rename("share")
-        .reset_index()
-    )
-    s_pivot = s_share.pivot(index=sc.CONTACT_ID, columns="season_br", values="share").fillna(0.0)
-    s_pivot = (
-        s_pivot.rename(
-            columns={
-                "verao": "pct_verao",
-                "outono": "pct_outono",
-                "inverno": "pct_inverno",
-                "primavera": "pct_primavera",
-            }
-        )
-        .reindex(columns=["pct_verao", "pct_outono", "pct_inverno", "pct_primavera"], fill_value=0.0)
-        .reset_index()
+    # === Estação BR (participação por estação) ===
+    s_tab = pd.crosstab(
+        x[sc.CONTACT_ID],
+        x["season_br"],
+        normalize="index",
+        dropna=False,
+    ).fillna(0.0)
+    s_tab = s_tab.rename(columns={
+        "verao": "pct_verao",
+        "outono": "pct_outono",
+        "inverno": "pct_inverno",
+        "primavera": "pct_primavera",
+    })
+    s_tab = s_tab.reindex(
+        columns=["pct_verao", "pct_outono", "pct_inverno", "pct_primavera"],
+        fill_value=0.0,
     )
 
-    # daypart
-    d_share = (
-        x.groupby([sc.CONTACT_ID, "daypart"], observed=True)
-        .size()
-        .groupby(level=0)
-        .apply(lambda s: s / s.sum())
-        .rename("share")
-        .reset_index()
-    )
-    d_pivot = d_share.pivot(index=sc.CONTACT_ID, columns="daypart", values="share").fillna(0.0)
-    d_pivot = (
-        d_pivot.rename(
-            columns={
-                "madrugada": "pct_madrugada",
-                "manha": "pct_manha",
-                "tarde": "pct_tarde",
-                "noite": "pct_noite",
-            }
-        )
-        .reindex(columns=["pct_madrugada", "pct_manha", "pct_tarde", "pct_noite"], fill_value=0.0)
-        .reset_index()
+    # === Daypart (participação por faixa do dia) ===
+    d_tab = pd.crosstab(
+        x[sc.CONTACT_ID],
+        x["daypart"],
+        normalize="index",
+        dropna=False,
+    ).fillna(0.0)
+    d_tab = d_tab.rename(columns={
+        "madrugada": "pct_madrugada",
+        "manha": "pct_manha",
+        "tarde": "pct_tarde",
+        "noite": "pct_noite",
+    })
+    d_tab = d_tab.reindex(
+        columns=["pct_madrugada", "pct_manha", "pct_tarde", "pct_noite"],
+        fill_value=0.0,
     )
 
-    # holiday
-    if "is_holiday" in x.columns:
-        hol = (
-            x.groupby(sc.CONTACT_ID, observed=True)["is_holiday"]
-            .mean()
-            .rename("pct_holiday")
-            .reset_index()
-        )
-    else:
-        hol = total[[sc.CONTACT_ID]].copy()
-        hol["pct_holiday"] = 0.0
+    # === % Weekend ===
+    weekend = (
+        x.groupby(sc.CONTACT_ID, observed=True, as_index=False)["is_weekend"]
+         .mean()
+         .rename(columns={"is_weekend": "pct_weekend"})
+         .set_index(sc.CONTACT_ID)
+    )
 
-    # Merge final
-    out = (
-        total[[sc.CONTACT_ID]]
-        .merge(weekend, on=sc.CONTACT_ID, how="left")
-        .merge(q_pivot, on=sc.CONTACT_ID, how="left")
-        .merge(s_pivot, on=sc.CONTACT_ID, how="left")
-        .merge(d_pivot, on=sc.CONTACT_ID, how="left")
-        .merge(hol, on=sc.CONTACT_ID, how="left")
-        .fillna(0.0)
+    # === % Holiday (se não existir, zera) ===
+    if "is_holiday" not in x.columns:
+        x = x.assign(is_holiday=False)
+
+    holiday = (
+        x.groupby(sc.CONTACT_ID, observed=True, as_index=False)["is_holiday"]
+         .mean()
+         .rename(columns={"is_holiday": "pct_holiday"})
+         .set_index(sc.CONTACT_ID)
+    )
+
+    # === Join final por índice (fk_contact) ===
+    seas = (
+        q_tab.join(s_tab, how="left")
+             .join(d_tab, how="left")
+             .join(weekend, how="left")
+             .join(holiday, how="left")
+             .fillna(0.0)
+             .reset_index()  # seguro: fk_contact está apenas no índice até aqui
     )
 
     # Tipos estáveis
-    pct_cols = [c for c in out.columns if c.startswith("pct_")]
-    out[pct_cols] = out[pct_cols].astype("float64")
-    return out
+    pct_cols = [c for c in seas.columns if c.startswith("pct_")]
+    seas[pct_cols] = seas[pct_cols].astype("float64")
+    return seas
+
 
 
 # =========================================================
@@ -317,6 +305,16 @@ def build_intensity(df: pd.DataFrame) -> pd.DataFrame:
     inten["total_tickets_12m"] = pd.to_numeric(inten["total_tickets_12m"], errors="coerce").fillna(0).astype("Int64")
     inten["avg_price_per_ticket"] = pd.to_numeric(inten["avg_price_per_ticket"], errors="coerce").astype("float64")
     return inten
+
+def _reset_index_safe(df: pd.DataFrame, *, key: str) -> pd.DataFrame:
+    """
+    Faz reset_index garantindo que a coluna `key` não esteja duplicada.
+    Se `key` já existir em df.columns, ela é removida antes do reset.
+    """
+    if key in df.columns:
+        df = df.drop(columns=[key])
+    return df.reset_index()
+
 
 
 # =========================================================

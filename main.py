@@ -5,7 +5,7 @@ import sys
 
 import pandas as pd
 
-from src import data_loader, cleaning, io_saver, windowing
+from src import data_loader, cleaning, io_saver, windowing, feature_builder
 from src import config
 
 # Configuração básica de logging
@@ -27,15 +27,14 @@ def main():
         # 2) Rodar pipeline de limpeza
         results = cleaning.run_cleaning_pipeline(df_raw, tz=config.TIMEZONE)
 
-        # 3) Salvar resultados
+        # 3) Salvar resultados intermediários
         output_path = config.RUN_OUTPUT_PATH
         for name, df in results.items():
             if isinstance(df, pd.DataFrame):
-                # Salvar todos como parquet seguro
                 out_file = output_path / f"{name}.parquet"
                 io_saver.save_single_parquet(df, out_file)
 
-                # Para df_clean: salvar também particionado
+                # Para df_clean: salvar particionado e seguir com janela + features
                 if name == "df_clean":
                     io_saver.save_partitioned_by_year(
                         df,
@@ -49,15 +48,26 @@ def main():
                     df_window, start_date, build_date, end_date = windowing.build_observation_window(
                         df,
                         build_date=config.DEFAULT_BUILD_DATE,
-                        janela_meses=12,
+                        janela_meses=2,
                         post_filter_valid=True,
                         min_rows=1000,
                     )
                     windowing.save_window_parquet(
                         df_window,
                         out_dir=output_path,
-                        janela_meses=12,
+                        janela_meses=0.5,
                         filename_prefix="df_clean_window",
+                    )
+
+                    # 5) Construir features de cliente e salvar
+                    df_feats = feature_builder.build_customer_features(
+                        df_window,
+                        build_date=config.DEFAULT_BUILD_DATE,
+                        model_version=config.MODEL_VERSION,
+                    )
+                    feature_builder.save_customer_features(
+                        df_feats,
+                        out_path=config.path_customer_features(output_path),
                     )
 
         logger.info("Pipeline concluído com sucesso!")
