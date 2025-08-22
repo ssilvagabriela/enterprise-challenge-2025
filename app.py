@@ -461,4 +461,111 @@ else:
     except Exception:
         pass
 
+# ============================
+# Visualizações adicionais — clusters
+# ============================
+st.header("Visualizações dos clusters")
+
+try:
+    from sklearn.decomposition import PCA
+except Exception:
+    PCA = None
+
+if st.session_state.runs:
+    run_sel = st.session_state.runs[sel_idx - 1]
+    paths = run_sel["paths"]
+    z_suffix = run_sel["params"].get("z_suffix", "_z")
+
+    # ---- 1) Tamanho dos clusters (barra)
+    try:
+        asg_df = pd.read_parquet(paths["assignments"]).copy()
+        size_df = asg_df.groupby("cluster_id").size().reset_index(name="n_clientes").sort_values("cluster_id")
+        st.subheader("Tamanho dos clusters")
+        fig_sz = px.bar(size_df, x="cluster_id", y="n_clientes")
+        st.plotly_chart(fig_sz, use_container_width=True)
+    except Exception as e:
+        st.info(f"Não foi possível montar o gráfico de tamanhos: {e}")
+
+    # ---- 2) Projeção 2D (PCA) dos clientes
+    st.subheader("Projeção 2D dos clientes (PCA)")
+    try:
+        if PCA is None:
+            st.warning("scikit-learn não disponível para PCA. Instale 'scikit-learn'.")
+        else:
+            # Lê features padronizadas e junta com o cluster assign
+            df_std = pd.read_parquet(paths["standardized"])  # contém fk_contact + colunas z
+            asg_df = pd.read_parquet(paths["assignments"]).copy()
+            id_col = getattr(config, "CONTACT_ID", "fk_contact")
+            dfm = df_std.merge(asg_df, on=id_col, how="left")
+            z_cols = [c for c in dfm.columns if c.endswith(z_suffix)]
+
+            # Amostra para não explodir o navegador
+            max_points = 20000
+            if len(dfm) > max_points:
+                dfm = dfm.sample(max_points, random_state=1)
+
+            pca = PCA(n_components=2, random_state=0)
+            coords = pca.fit_transform(dfm[z_cols].values)
+            proj = pd.DataFrame(coords, columns=["PC1", "PC2"]).assign(cluster_id=dfm["cluster_id"].values)
+            fig_scatter = px.scatter(
+                proj, x="PC1", y="PC2", color="cluster_id", opacity=0.7,
+                title="PCA dos z-scores por cliente"
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.caption("Dica: clusters separáveis tendem a formar "
+                       "grupos bem definidos neste espaço 2D; sobreposição indica similaridade.")
+    except Exception as e:
+        st.info(f"Não foi possível montar o scatter PCA: {e}")
+
+    # ---- 3) Radar dos centróides (top variáveis por |z|)
+    st.subheader("Perfil dos clusters (radar por centróide)")
+try:
+    cz = pd.read_parquet(paths["centroids_z"]).copy()
+
+    # --- Robustez de formato: coluna/índice/long format ---
+    # Se vier com MultiIndex, resetamos
+    if isinstance(cz.index, pd.MultiIndex):
+        cz = cz.reset_index()
+    # Se 'cluster_id' não é coluna, tente promover índice
+    if "cluster_id" not in cz.columns:
+        cz = cz.reset_index()
+        if "cluster_id" not in cz.columns:
+            if "index" in cz.columns:
+                cz = cz.rename(columns={"index": "cluster_id"})
+            elif "cluster" in cz.columns:
+                cz = cz.rename(columns={"cluster": "cluster_id"})
+    # Se vier no formato longo (cluster_id, feature, z), pivotamos para wide
+    if {"cluster_id", "feature", "z"}.issubset(set(cz.columns)):
+        cz = cz.pivot(index="cluster_id", columns="feature", values="z").reset_index()
+
+    # Converte cluster_id para numérico quando possível
+    try:
+        cz["cluster_id"] = pd.to_numeric(cz["cluster_id"]).astype(int)
+    except Exception:
+        pass
+
+    # Lista de clusters disponíveis
+    cluster_choices = sorted(cz["cluster_id"].unique().tolist())
+    clust_opt = st.selectbox("Cluster para inspecionar", cluster_choices, index=0)
+
+    top_n = int(st.slider("Top variáveis por |z|", min_value=3, max_value=20, value=8))
+    row = cz.loc[cz["cluster_id"] == clust_opt].iloc[0]
+
+    # Colunas numéricas (z) do centróide
+    z_cols_in_cz = [c for c in row.index if c != "cluster_id"]
+    s = row[z_cols_in_cz].astype(float)
+    vals = s.sort_values(key=lambda s: s.abs(), ascending=False).head(top_n)
+
+    rad = pd.DataFrame({
+        "feature": [str(c).replace(z_suffix, "") for c in vals.index],
+        "z": vals.values,
+    })
+    rad = pd.concat([rad, rad.iloc[[0]]])  # fecha o polígono
+
+    fig_radar = px.line_polar(rad, r="z", theta="feature", line_close=True)
+    st.plotly_chart(fig_radar, use_container_width=True)
+    st.caption("Valores positivos (z) indicam o centróide acima da média global na variável; negativos, abaixo.")
+except Exception as e:
+    st.info(f"Não foi possível montar o radar dos centróides: {e}")
+
 st.caption("NexTrip AI · Clique em 'Executar pipeline' após definir os parâmetros na barra lateral. Cada execução cria uma pasta dedicada em 'Diretório base de saída' contendo todos os artefatos.")
